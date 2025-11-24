@@ -154,6 +154,13 @@ def get_order_status():
     menu()
 
 ###########################################
+def add_row(db_row):
+    db = mongo_client['TradingApp']
+    collection = db['HistoricalData']
+    result = collection.insert_many(db_row)
+    print(f'Inserted document IDs: {result.inserted_ids}')
+
+###########################################
 def get_historical_data():
     stock_list = get_stock_list()
     print(stock_list)
@@ -192,11 +199,13 @@ def get_historical_data():
         print(bars[stock])
 
         # QUOTES DATA
+        db_rows = {}
         quote_df = convert_data(stock, quotes.data.get(stock), 'quote')
         minute_summary = quote_df['ask_price'].resample('1min').mean()
         print(f'## HISTORICAL QUOTE DATA FOR: {stock}')
         for ts, ask in minute_summary.dropna().items():
             print(f'{stock} - {ts}: {ask}') 
+            db_rows[ts] = ({"stock": stock, "timestamp": ts, "quote": ask})
 
         # TRADES DATA
         trade_df = convert_data(stock, trades.data.get(stock), 'trade')
@@ -204,7 +213,15 @@ def get_historical_data():
         print(f'## HISTORICAL TRADE DATA FOR: {stock}')
         for ts, row in minute_trades.dropna().iterrows():
             print(f'{stock} - {ts}: {row["price"]} ~ {row["size"]} shares')
+            if ts in db_rows:
+                db_rows[ts]["trade_price"] = row['price']
+                db_rows[ts]["shares"] = row['size']
+            else:
+                db_rows[ts] = {"stock": stock, "timestamp": ts, "trade_price": row['price'], "shares": row['size']}
+            # print(db_row)
+        add_row(list(db_rows.values()))
         
+    mongo_client.close()
     menu()
 
 ###########################################
