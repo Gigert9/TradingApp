@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data import StockHistoricalDataClient, StockLatestQuoteRequest, StockBarsRequest, TimeFrame, StockQuotesRequest
+from alpaca.data import StockHistoricalDataClient, StockLatestQuoteRequest, StockBarsRequest, TimeFrame, StockQuotesRequest, StockTradesRequest
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
@@ -87,6 +87,23 @@ def get_stock_list():
     return stock_list
 
 ###########################################
+def convert_data(stock, data, action):
+    if not data:
+        print(f'No {action} data found for {stock} in the last 30 days.')
+        return None
+    if not isinstance(data[0], dict):
+        data = [
+            d.model_dump() if hasattr(d, "model_dump") else d.dict() if hasattr(d, "dict") else vars(d) for d in data
+        ]
+    df = pd.DataFrame(data)
+    if df.empty or 'timestamp' not in df.columns:
+        print(f'Data for {stock} is incomplete. Columns found: {df.columns}')
+        return None
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index('timestamp', inplace=True)
+    return df
+
+###########################################
 def get_stock_info():
     stock_list = get_stock_list()
     print(stock_list)
@@ -141,7 +158,7 @@ def get_historical_data():
     stock_list = get_stock_list()
     print(stock_list)
     current_datetime = datetime.now()
-    thirty_days_ago = current_datetime - timedelta(days=30)
+    thirty_days_ago = current_datetime - timedelta(days=1)
 
     bar_request_params = StockBarsRequest(
         symbol_or_symbols=stock_list,
@@ -154,37 +171,40 @@ def get_historical_data():
         symbol_or_symbols=stock_list,
         start=thirty_days_ago,
         end=current_datetime,
-        limit=20
+        # limit=20 #REMOVE FOR PRODUCTION
+    )
+
+    trade_request_params = StockTradesRequest(
+        symbol_or_symbols=stock_list,
+        start=thirty_days_ago,
+        end=current_datetime,
+        # limit=20 # REMOVE FROM PROD
     )
 
     bars = historical_client.get_stock_bars(bar_request_params)
     bars.df
     quotes = historical_client.get_stock_quotes(quote_request_params)
+    trades = historical_client.get_stock_trades(trade_request_params)
 
     for stock in stock_list:
-        ask_data = []
+        # BAR DATA
         print(f'## BAR DATA FOR: {stock}')
         print(bars[stock])
+
+        # QUOTES DATA
+        quote_df = convert_data(stock, quotes.data.get(stock), 'quote')
+        minute_summary = quote_df['ask_price'].resample('1min').mean()
         print(f'## HISTORICAL QUOTE DATA FOR: {stock}')
-        for q in quotes[stock]:
-            ask_data.append({
-                'timestamp': q.timestamp,
-                'ask_price': q.ask_price
-            })
-        df = pd.DataFrame(ask_data)
-
-        if df.empty:
-            print('No data avaialble for this period.')
-            continue
-
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-        #Resample Historical Quotes by minute
-        df.set_index('timestamp', inplace=True)
-        minute_summary = df['ask_price'].resample('1min').mean()
         for ts, ask in minute_summary.dropna().items():
-            print(f'{ts}: {ask}')
-    
+            print(f'{stock} - {ts}: {ask}') 
+
+        # TRADES DATA
+        trade_df = convert_data(stock, trades.data.get(stock), 'trade')
+        minute_trades = trade_df.resample('1min').agg({'price':'mean', 'size':'sum'})
+        print(f'## HISTORICAL TRADE DATA FOR: {stock}')
+        for ts, row in minute_trades.dropna().iterrows():
+            print(f'{stock} - {ts}: {row["price"]} ~ {row["size"]} shares')
+        
     menu()
 
 ###########################################
