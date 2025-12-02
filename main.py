@@ -189,14 +189,24 @@ def get_historical_data():
     )
 
     bars = historical_client.get_stock_bars(bar_request_params)
-    bars.df
+    bars_df = bars.df  # DataFrame with bar attributes: open, high, low, close, volume, trade_count, vwap
     quotes = historical_client.get_stock_quotes(quote_request_params)
     trades = historical_client.get_stock_trades(trade_request_params)
 
     for stock in stock_list:
         # BAR DATA
         print(f'## BAR DATA FOR: {stock}')
-        print(bars[stock])
+        if stock in bars:
+            # bars[stock] is a list of Bar objects, each with the requested attributes
+            for bar in bars[stock]:
+                print(
+                    f"{stock} - {bar.timestamp}: "
+                    f"open={bar.open}, high={bar.high}, low={bar.low}, "
+                    f"close={bar.close}, volume={bar.volume}, "
+                    f"trade_count={bar.trade_count}, vwap={bar.vwap}"
+                )
+        else:
+            print(f'No bar data for {stock}')
 
         # QUOTES DATA
         db_rows = {}
@@ -218,7 +228,6 @@ def get_historical_data():
                 db_rows[ts]["shares"] = row['size']
             else:
                 db_rows[ts] = {"stock": stock, "timestamp": ts, "trade_price": row['price'], "shares": row['size']}
-            # print(db_row)
         add_row(list(db_rows.values()))
         
     mongo_client.close()
