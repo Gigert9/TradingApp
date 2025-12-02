@@ -189,13 +189,14 @@ def get_historical_data():
     )
 
     bars = historical_client.get_stock_bars(bar_request_params)
-    bars_df = bars.df  # DataFrame with bar attributes: open, high, low, close, volume, trade_count, vwap
     quotes = historical_client.get_stock_quotes(quote_request_params)
     trades = historical_client.get_stock_trades(trade_request_params)
 
     for stock in stock_list:
         # BAR DATA
         print(f'## BAR DATA FOR: {stock}')
+        db_rows = {}
+
         if stock in bars:
             # bars[stock] is a list of Bar objects, each with the requested attributes
             for bar in bars[stock]:
@@ -205,30 +206,69 @@ def get_historical_data():
                     f"close={bar.close}, volume={bar.volume}, "
                     f"trade_count={bar.trade_count}, vwap={bar.vwap}"
                 )
+
+                # Save bar data into db_rows using the standard structure
+                ts = bar.timestamp
+                if ts in db_rows:
+                    db_rows[ts].update(
+                        {
+                            "open": bar.open,
+                            "high": bar.high,
+                            "low": bar.low,
+                            "close": bar.close,
+                            "volume": bar.volume,
+                            "trade_count": bar.trade_count,
+                            "vwap": bar.vwap,
+                        }
+                    )
+                else:
+                    db_rows[ts] = {
+                        "stock": stock,
+                        "timestamp": ts,
+                        "open": bar.open,
+                        "high": bar.high,
+                        "low": bar.low,
+                        "close": bar.close,
+                        "volume": bar.volume,
+                        "trade_count": bar.trade_count,
+                        "vwap": bar.vwap,
+                    }
         else:
             print(f'No bar data for {stock}')
 
         # QUOTES DATA
-        db_rows = {}
         quote_df = convert_data(stock, quotes.data.get(stock), 'quote')
-        minute_summary = quote_df['ask_price'].resample('1min').mean()
-        print(f'## HISTORICAL QUOTE DATA FOR: {stock}')
-        for ts, ask in minute_summary.dropna().items():
-            print(f'{stock} - {ts}: {ask}') 
-            db_rows[ts] = ({"stock": stock, "timestamp": ts, "quote": ask})
+        if quote_df is not None:
+            minute_summary = quote_df['ask_price'].resample('1min').mean()
+            print(f'## HISTORICAL QUOTE DATA FOR: {stock}')
+            for ts, ask in minute_summary.dropna().items():
+                print(f'{stock} - {ts}: {ask}')
+                if ts in db_rows:
+                    db_rows[ts]["quote"] = ask
+                else:
+                    db_rows[ts] = {"stock": stock, "timestamp": ts, "quote": ask}
 
         # TRADES DATA
         trade_df = convert_data(stock, trades.data.get(stock), 'trade')
-        minute_trades = trade_df.resample('1min').agg({'price':'mean', 'size':'sum'})
-        print(f'## HISTORICAL TRADE DATA FOR: {stock}')
-        for ts, row in minute_trades.dropna().iterrows():
-            print(f'{stock} - {ts}: {row["price"]} ~ {row["size"]} shares')
-            if ts in db_rows:
-                db_rows[ts]["trade_price"] = row['price']
-                db_rows[ts]["shares"] = row['size']
-            else:
-                db_rows[ts] = {"stock": stock, "timestamp": ts, "trade_price": row['price'], "shares": row['size']}
-        add_row(list(db_rows.values()))
+        if trade_df is not None:
+            minute_trades = trade_df.resample('1min').agg({'price': 'mean', 'size': 'sum'})
+            print(f'## HISTORICAL TRADE DATA FOR: {stock}')
+            for ts, row in minute_trades.dropna().iterrows():
+                print(f'{stock} - {ts}: {row["price"]} ~ {row["size"]} shares')
+                if ts in db_rows:
+                    db_rows[ts]["trade_price"] = row['price']
+                    db_rows[ts]["shares"] = row['size']
+                else:
+                    db_rows[ts] = {
+                        "stock": stock,
+                        "timestamp": ts,
+                        "trade_price": row['price'],
+                        "shares": row['size'],
+                    }
+
+        # Persist combined bar/quote/trade data for this stock
+        if db_rows:
+            add_row(list(db_rows.values()))
         
     mongo_client.close()
     menu()
