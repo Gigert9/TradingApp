@@ -300,13 +300,15 @@ def get_historical_data():
         symbol_or_symbols=stock_list,
         timeframe=TimeFrame.Minute,
         start=thirty_days_ago,
-        end=current_datetime
+        end=current_datetime,
+        feed="iex"
     )
 
     quote_request_params = StockQuotesRequest(
         symbol_or_symbols=stock_list,
         start=thirty_days_ago,
         end=current_datetime,
+        feed="iex",
         # limit=20 #REMOVE FOR PRODUCTION
     )
 
@@ -314,6 +316,7 @@ def get_historical_data():
         symbol_or_symbols=stock_list,
         start=thirty_days_ago,
         end=current_datetime,
+        feed="iex",
         # limit=20 # REMOVE FROM PROD
     )
 
