@@ -234,6 +234,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default="prediction",
         help="MongoDB collection name to write predictions to (default: prediction).",
     )
+    p.add_argument(
+        "--predict-next",
+        action="store_true",
+        help="Predict ClosePrice at t+1 from features at t and save a single next-step forecast.",
+    )
     return p.parse_args(argv)
 
 
@@ -294,15 +299,43 @@ def main(argv: Optional[List[str]] = None) -> int:
             if cand in df.columns:
                 detected_time_col = cand
                 break
-    times_series = None
+    # Coerce to timezone-aware datetime and sort ascending when time column is present
+    expectedtime_iso = None
+    X_next = None
     if detected_time_col:
-        # Coerce to timezone-aware datetime; keep a parallel series for expectedtime
-        times_series = pd.to_datetime(df[detected_time_col], utc=True, errors="coerce")
+        df[detected_time_col] = pd.to_datetime(df[detected_time_col], utc=True, errors="coerce")
+        df = df.sort_values(detected_time_col).reset_index(drop=True)
+        print(f"[mljar] Using time column: {detected_time_col}")
+    # If next-step forecasting is requested, shift target and prepare next-step features
+    if getattr(args, "predict_next", False):
+        if not detected_time_col:
+            raise SystemExit("--predict-next requires a time column in the data (e.g., 't' or 'Timestamp').")
+        target_name = "TargetNext"
+        df[target_name] = df[args.target].shift(-1)
+        if len(df) < 2:
+            raise SystemExit("Not enough rows to compute next-step prediction")
+        # Compute expected time for next bar: last observed time + median interval (fallback 1 day)
+        time_diffs = df[detected_time_col].diff()
+        try:
+            step = time_diffs.median()
+        except Exception:
+            step = None
+        if not isinstance(step, pd.Timedelta) or pd.isna(step) or step == pd.Timedelta(0):
+            step = pd.Timedelta(days=1)
+        last_time = df[detected_time_col].iloc[-2]
+        expectedtime_iso = (last_time + step).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Build X_next from the last available feature row (index -2)
+        drop_cols_for_next = [args.target, target_name, detected_time_col]
+        feature_cols = [c for c in df.columns if c not in drop_cols_for_next]
+        X_next = df.loc[[-2], feature_cols]
+        # Drop last row (NaN shifted target) and rename shifted target to original target for training
+        df = df.iloc[:-1].rename(columns={target_name: args.target})
+    # Keep time series for potential splitting (non next-step path)
+    times_series = df[detected_time_col] if detected_time_col else None
+    # Split X and y
     X, y = _split_xy(df, args.target)
     if detected_time_col and detected_time_col in X.columns:
         X = X.drop(columns=[detected_time_col])
-    if detected_time_col:
-        print(f"[mljar] Using time column: {detected_time_col}")
     task_hint = _detect_task(y)
 
     # Stratify only for classification
@@ -313,7 +346,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             stratify = None
 
-    if times_series is not None:
+    if getattr(args, "predict_next", False):
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=args.test_size, random_state=args.random_state, shuffle=False
+        )
+    elif times_series is not None:
         X_train, X_test, y_train, y_test, t_train, t_test = train_test_split(
             X, y, times_series, test_size=args.test_size, random_state=args.random_state, stratify=stratify
         )
@@ -352,6 +389,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Evaluate on holdout
     preds = automl.predict(X_test)
+    # Compute next-step prediction if requested
+    next_pred = None
+    if getattr(args, "predict_next", False) and 'X_next' in locals() and X_next is not None:
+        try:
+            next_pred = float(automl.predict(X_next)[0])
+            print(f"[mljar] Next-step prediction: {args.target}={next_pred}")
+        except Exception as e:
+            print(f"[mljar] Failed to compute next-step prediction: {e}")
     # AutoML has built-in scoring in reports; optionally compute basic score if numeric
     confidence = None
     try:
@@ -382,56 +427,67 @@ def main(argv: Optional[List[str]] = None) -> int:
         sym = str(args.symbol).strip().upper() if args.symbol else None
         source_collection = args.mongo_collection or args.collection or "csv"
         out_collection = args.output_collection or "prediction"
-        if sym and 't_test' in locals():
-            times_iso = (
-                pd.to_datetime(pd.Series(t_test), utc=True, errors='coerce')
-                .dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-                .tolist()
-            )
-            # Flatten predictions to a 1D list
-            preds_list = preds.tolist() if hasattr(preds, "tolist") else list(preds)
+        client = _connect_mongo()
+        db_name = args.mongo_db or os.getenv("MONGODB_DB") or "TradingApp"
+        out_col = client[db_name][out_collection]
 
-            # Build valid (time, prediction) pairs
-            pairs = []
-            for iso, pred in zip(times_iso, preds_list):
-                if not isinstance(iso, str) or not iso:
-                    continue
-                if isinstance(pred, (list, tuple)):
-                    pred_val = pred[0] if len(pred) > 0 else None
-                else:
-                    try:
-                        pred_val = float(pred)
-                    except Exception:
-                        pred_val = None
-                if pred_val is None:
-                    continue
-                pairs.append((iso, pred_val))
-
-            if pairs:
-                # Select the latest expectedtime and its prediction
-                latest_iso = max(iso for iso, _ in pairs)
-                latest_pred = next(val for iso, val in pairs if iso == latest_iso)
-
-                client = _connect_mongo()
-                db_name = args.mongo_db or os.getenv("MONGODB_DB") or "TradingApp"
-                out_col = client[db_name][out_collection]
-
+        if getattr(args, "predict_next", False):
+            if not sym or not expectedtime_iso or next_pred is None:
+                print("[mljar] Skipping MongoDB save: missing symbol, expected time, or next prediction")
+            else:
                 out_col.update_one(
-                    {"symbol": sym, "collection": source_collection, "expectedtime": latest_iso},
+                    {"symbol": sym, "collection": source_collection, "expectedtime": expectedtime_iso},
                     {"$set": {
                         "symbol": sym,
                         "collection": source_collection,
-                        "expectedtime": latest_iso,
+                        "expectedtime": expectedtime_iso,
                         "confidence": confidence,
-                        args.target: latest_pred,
+                        args.target: float(next_pred),
                     }},
                     upsert=True,
                 )
-                print(f"[mljar] Saved latest prediction record to MongoDB collection '{out_collection}' at expectedtime={latest_iso}")
-            else:
-                print("[mljar] No valid (time, prediction) pairs to save")
+                print(f"[mljar] Saved next-step prediction to MongoDB collection '{out_collection}' at expectedtime={expectedtime_iso}")
         else:
-            print("[mljar] Skipping MongoDB save: missing symbol or time column not found in data")
+            if sym and 't_test' in locals():
+                times_iso = (
+                    pd.to_datetime(pd.Series(t_test), utc=True, errors='coerce')
+                    .dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+                    .tolist()
+                )
+                preds_list = preds.tolist() if hasattr(preds, "tolist") else list(preds)
+                pairs = []
+                for iso, pred in zip(times_iso, preds_list):
+                    if not isinstance(iso, str) or not iso:
+                        continue
+                    if isinstance(pred, (list, tuple)):
+                        pred_val = pred[0] if len(pred) > 0 else None
+                    else:
+                        try:
+                            pred_val = float(pred)
+                        except Exception:
+                            pred_val = None
+                    if pred_val is None:
+                        continue
+                    pairs.append((iso, pred_val))
+                if pairs:
+                    latest_iso = max(iso for iso, _ in pairs)
+                    latest_pred = next(val for iso, val in pairs if iso == latest_iso)
+                    out_col.update_one(
+                        {"symbol": sym, "collection": source_collection, "expectedtime": latest_iso},
+                        {"$set": {
+                            "symbol": sym,
+                            "collection": source_collection,
+                            "expectedtime": latest_iso,
+                            "confidence": confidence,
+                            args.target: latest_pred,
+                        }},
+                        upsert=True,
+                    )
+                    print(f"[mljar] Saved latest prediction record to MongoDB collection '{out_collection}' at expectedtime={latest_iso}")
+                else:
+                    print("[mljar] No valid (time, prediction) pairs to save")
+            else:
+                print("[mljar] Skipping MongoDB save: missing symbol or time column not found in data")
     except Exception as e:
         print(f"[mljar] Failed to save predictions to MongoDB: {e}")
 
