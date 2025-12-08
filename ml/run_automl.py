@@ -239,6 +239,29 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Predict ClosePrice at t+1 from features at t and save a single next-step forecast.",
     )
+    p.add_argument(
+        "--tune-strong",
+        action="store_true",
+        help="Enable stronger tuning (switch to 'Compete' mode if currently 'Explain').",
+    )
+    p.add_argument(
+        "--validation-type",
+        choices=["auto", "split", "kfold", "time"],
+        default="auto",
+        help="Validation strategy. 'auto' picks 'time' if time column present or --predict-next, otherwise 'split'.",
+    )
+    p.add_argument(
+        "--train-ratio",
+        type=float,
+        default=0.8,
+        help="Train ratio for split/time validation (default: 0.8).",
+    )
+    p.add_argument(
+        "--k-folds",
+        type=int,
+        default=5,
+        help="Number of folds for kfold validation (default: 5).",
+    )
     return p.parse_args(argv)
 
 
@@ -375,13 +398,38 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     algorithms = _comma_list(args.algorithms)
+    # Provide a stronger default algorithm set when tuning is requested and none specified
+    if getattr(args, "tune_strong", False) and args.algorithms is None:
+        algorithms = ["LightGBM", "Xgboost", "CatBoost", "Random Forest", "Extra Trees", "Linear"]
 
     # Select a default evaluation metric if none provided.
     # For ClosePrice regression we default to RMSE; for classification we use logloss.
     eval_metric = args.eval_metric or ("rmse" if "regression" in task_hint else "logloss")
 
+    # Build validation strategy
+    validation_strategy = None
+    tr = max(0.5, min(float(args.train_ratio), 0.95))
+    if args.validation_type == "auto":
+        if args.predict_next or ("t" in df.columns):
+            validation_strategy = {"validation_type": "time", "train_ratio": tr}
+        else:
+            validation_strategy = {"validation_type": "split", "train_ratio": tr}
+    elif args.validation_type == "time":
+        validation_strategy = {"validation_type": "time", "train_ratio": tr}
+    elif args.validation_type == "split":
+        validation_strategy = {"validation_type": "split", "train_ratio": tr}
+    elif args.validation_type == "kfold":
+        kf = max(2, int(args.k_folds))
+        validation_strategy = {"validation_type": "kfold", "k_folds": kf}
+
+    # Potentially strengthen mode when requested
+    mode_use = args.mode
+    if getattr(args, "tune_strong", False) and args.mode == "Explain":
+        mode_use = "Compete"
+        print("[mljar] tune-strong enabled: switching mode to 'Compete' for stronger tuning")
+
     automl_kwargs = dict(
-        mode=args.mode,
+        mode=mode_use,
         total_time_limit=args.time_limit,
         results_path=results_path,
         eval_metric=eval_metric,
@@ -391,12 +439,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Let AutoML detect task, but we provide a hint via 'ml_task' if desired.
         # ml_task=task_hint,
     )
+    if validation_strategy:
+        automl_kwargs["validation_strategy"] = validation_strategy
     if algorithms:
         automl_kwargs["algorithms"] = algorithms
 
     automl = AutoML(**automl_kwargs)
 
-    print(f"[mljar] Starting AutoML in mode={args.mode} time_limit={args.time_limit}s")
+    print(f"[mljar] Starting AutoML in mode={automl_kwargs.get('mode')} time_limit={args.time_limit}s")
     print(f"[mljar] Results path: {results_path}")
     print(f"[mljar] Detected task hint: {task_hint}")
 
