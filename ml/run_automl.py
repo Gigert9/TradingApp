@@ -376,14 +376,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             # Flatten predictions to a 1D list
             preds_list = preds.tolist() if hasattr(preds, "tolist") else list(preds)
-            client = _connect_mongo()
-            db_name = args.mongo_db or os.getenv("MONGODB_DB") or "TradingApp"
-            out_col = client[db_name][out_collection]
-            saved = 0
+
+            # Build valid (time, prediction) pairs
+            pairs = []
             for iso, pred in zip(times_iso, preds_list):
                 if not isinstance(iso, str) or not iso:
                     continue
-                # Ensure scalar prediction value
                 if isinstance(pred, (list, tuple)):
                     pred_val = pred[0] if len(pred) > 0 else None
                 else:
@@ -393,19 +391,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                         pred_val = None
                 if pred_val is None:
                     continue
+                pairs.append((iso, pred_val))
+
+            if pairs:
+                # Select the latest expectedtime and its prediction
+                latest_iso = max(iso for iso, _ in pairs)
+                latest_pred = next(val for iso, val in pairs if iso == latest_iso)
+
+                client = _connect_mongo()
+                db_name = args.mongo_db or os.getenv("MONGODB_DB") or "TradingApp"
+                out_col = client[db_name][out_collection]
+
                 out_col.update_one(
-                    {"symbol": sym, "collection": source_collection, "expectedtime": iso},
+                    {"symbol": sym, "collection": source_collection, "expectedtime": latest_iso},
                     {"$set": {
                         "symbol": sym,
                         "collection": source_collection,
-                        "expectedtime": iso,
+                        "expectedtime": latest_iso,
                         "confidence": confidence,
-                        args.target: pred_val,
+                        args.target: latest_pred,
                     }},
                     upsert=True,
                 )
-                saved += 1
-            print(f"[mljar] Saved {saved} prediction records to MongoDB collection '{out_collection}'")
+                print(f"[mljar] Saved latest prediction record to MongoDB collection '{out_collection}' at expectedtime={latest_iso}")
+            else:
+                print("[mljar] No valid (time, prediction) pairs to save")
         else:
             print("[mljar] Skipping MongoDB save: missing symbol or time column not found in data")
     except Exception as e:
