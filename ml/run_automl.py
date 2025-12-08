@@ -327,7 +327,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Build X_next from the last available feature row (index -2)
         drop_cols_for_next = [args.target, target_name, detected_time_col]
         feature_cols = [c for c in df.columns if c not in drop_cols_for_next]
-        X_next = df.loc[[-2], feature_cols]
+        X_next = df.iloc[[-2]][feature_cols]
         # Drop last row (NaN shifted target) and rename shifted target to original target for training
         df = df.iloc[:-1].rename(columns={target_name: args.target})
     # Keep time series for potential splitting (non next-step path)
