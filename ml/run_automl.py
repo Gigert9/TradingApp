@@ -3,7 +3,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 
 import pandas as pd
@@ -28,7 +28,7 @@ except ImportError as e:
 
 
 def _timestamp() -> str:
-    return datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
 def _ensure_results_path(path: Optional[str]) -> str:
@@ -291,11 +291,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     algorithms = _comma_list(args.algorithms)
 
-    automl = AutoML(
+    automl_kwargs = dict(
         mode=args.mode,
         total_time_limit=args.time_limit,
         results_path=results_path,
-        algorithms=algorithms,
         eval_metric=args.eval_metric,
         explain_level=args.explain_level,
         random_state=args.random_state,
@@ -303,6 +302,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         # Let AutoML detect task, but we provide a hint via 'ml_task' if desired.
         # ml_task=task_hint,
     )
+    if algorithms:
+        automl_kwargs["algorithms"] = algorithms
+
+    automl = AutoML(**automl_kwargs)
 
     print(f"[mljar] Starting AutoML in mode={args.mode} time_limit={args.time_limit}s")
     print(f"[mljar] Results path: {results_path}")
