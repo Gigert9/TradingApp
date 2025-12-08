@@ -2,3 +2,5 @@
 .env
 node_modules/
 package-lock.json
+ml/__pycache__
+ml/outputs
