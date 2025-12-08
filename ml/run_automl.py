@@ -227,7 +227,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--time-column",
         default="t",
-        help="Name of the time column to use as expectedtime (default: t). Will be removed from features.",
+        help="Name of the time column to use as expectedtime (default: t). If not found, will try common names like 'Timestamp'. The time column is removed from features.",
     )
     p.add_argument(
         "--output-collection",
@@ -284,11 +284,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     results_path = _ensure_results_path(args.results_path)
 
     df = load_dataframe(args)
-    time_col = args.time_column
-    times_series = df[time_col] if time_col in df.columns else None
+    # Determine time column: prefer --time-column; fallback to common names like 'Timestamp'
+    preferred_time_col = args.time_column
+    detected_time_col = None
+    if preferred_time_col and preferred_time_col in df.columns:
+        detected_time_col = preferred_time_col
+    else:
+        for cand in ["Timestamp", "timestamp", "time", "date", "datetime", "Datetime", "ts", "t"]:
+            if cand in df.columns:
+                detected_time_col = cand
+                break
+    times_series = df[detected_time_col] if detected_time_col else None
     X, y = _split_xy(df, args.target)
-    if time_col in X.columns:
-        X = X.drop(columns=[time_col])
+    if detected_time_col and detected_time_col in X.columns:
+        X = X.drop(columns=[detected_time_col])
     task_hint = _detect_task(y)
 
     # Stratify only for classification
