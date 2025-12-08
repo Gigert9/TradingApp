@@ -224,6 +224,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=1,
         help="Verbosity level for AutoML (default: 1).",
     )
+    p.add_argument(
+        "--time-column",
+        default="t",
+        help="Name of the time column to use as expectedtime (default: t). Will be removed from features.",
+    )
+    p.add_argument(
+        "--output-collection",
+        default="prediction",
+        help="MongoDB collection name to write predictions to (default: prediction).",
+    )
     return p.parse_args(argv)
 
 
@@ -274,7 +284,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     results_path = _ensure_results_path(args.results_path)
 
     df = load_dataframe(args)
+    time_col = args.time_column
+    times_series = df[time_col] if time_col in df.columns else None
     X, y = _split_xy(df, args.target)
+    if time_col in X.columns:
+        X = X.drop(columns=[time_col])
     task_hint = _detect_task(y)
 
     # Stratify only for classification
@@ -285,9 +299,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:
             stratify = None
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=args.random_state, stratify=stratify
-    )
+    if times_series is not None:
+        X_train, X_test, y_train, y_test, t_train, t_test = train_test_split(
+            X, y, times_series, test_size=args.test_size, random_state=args.random_state, stratify=stratify
+        )
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=args.test_size, random_state=args.random_state, stratify=stratify
+        )
 
     algorithms = _comma_list(args.algorithms)
 
@@ -320,6 +339,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Evaluate on holdout
     preds = automl.predict(X_test)
     # AutoML has built-in scoring in reports; optionally compute basic score if numeric
+    confidence = None
     try:
         import numpy as np
 
@@ -332,14 +352,47 @@ def main(argv: Optional[List[str]] = None) -> int:
             else:
                 preds_labels = preds
             acc = accuracy_score(y_test, preds_labels)
+            confidence = float(acc)
             print(f"[mljar] Holdout accuracy: {acc:.4f}")
         else:
             from sklearn.metrics import r2_score
 
             r2 = r2_score(y_test, preds)
+            confidence = float(r2)
             print(f"[mljar] Holdout R^2: {r2:.4f}")
     except Exception as e:
         print(f"[mljar] Skipping quick metric computation due to: {e}")
+
+    # Save predictions summary to MongoDB 'prediction' collection
+    try:
+        sym = str(args.symbol).strip().upper() if args.symbol else None
+        source_collection = args.mongo_collection or args.collection or "csv"
+        out_collection = args.output_collection or "prediction"
+        if sym and 't_test' in locals():
+            times = pd.to_datetime(pd.Series(t_test), utc=True, errors='coerce').dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            client = _connect_mongo()
+            db_name = args.mongo_db or os.getenv("MONGODB_DB") or "TradingApp"
+            out_col = client[db_name][out_collection]
+            saved = 0
+            for iso in times:
+                if not isinstance(iso, str) or not iso:
+                    continue
+                out_col.update_one(
+                    {"symbol": sym, "collection": source_collection, "expectedtime": iso},
+                    {"$set": {
+                        "symbol": sym,
+                        "collection": source_collection,
+                        "expectedtime": iso,
+                        "confidence": confidence,
+                    }},
+                    upsert=True,
+                )
+                saved += 1
+            print(f"[mljar] Saved {saved} prediction records to MongoDB collection '{out_collection}'")
+        else:
+            print("[mljar] Skipping MongoDB save: missing symbol or time column not found in data")
+    except Exception as e:
+        print(f"[mljar] Failed to save predictions to MongoDB: {e}")
 
     if args.save_predictions:
         out_csv = os.path.join(results_path, "test_predictions.csv")
