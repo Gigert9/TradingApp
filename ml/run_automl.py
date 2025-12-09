@@ -677,50 +677,36 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(f"[mljar] Next-step prediction: {args.target}={next_pred}")
         except Exception as e:
             print(f"[mljar] Failed to compute next-step prediction: {e}")
-    # AutoML has built-in scoring in reports; optionally compute basic score if numeric
-    confidence = None
+    # Compute holdout RMSE for regression tasks
+    rmse = None
     try:
         if "classification" in task_hint:
-            from sklearn.metrics import accuracy_score
-
-            # If prediction is probability array, take argmax
-            if isinstance(preds, (list, tuple)) or getattr(preds, "ndim", 1) > 1:
-                preds_labels = preds.argmax(axis=1)
-            else:
-                preds_labels = preds
-            acc = accuracy_score(y_test, preds_labels)
-            confidence = float(acc)
-            print(f"[mljar] Holdout accuracy: {acc:.4f}")
+            rmse = None
+            print("[mljar] Skipping RMSE: classification task detected")
         else:
-            from sklearn.metrics import r2_score
-
+            from sklearn.metrics import mean_squared_error
             if getattr(args, "predict_next", False) and transform_kind in ("pct", "log"):
-                # Compute R^2 in both return space and price space
-                r2_ret = r2_score(np.asarray(y_test, dtype=float).reshape(-1), np.asarray(preds, dtype=float).reshape(-1))
-                preds_price = _invert_target_transform(transform_kind, pd.Series(yprice_test.index, dtype=float).map(lambda idx: base_test.loc[idx] if hasattr(base_test, "loc") else np.nan) if False else base_test, preds)
-                # Ensure alignment
+                # Evaluate in price space
+                preds_price = _invert_target_transform(transform_kind, base_test, preds)
                 y_true_price = pd.Series(yprice_test).astype(float).reset_index(drop=True)
                 preds_price = pd.Series(preds_price).astype(float).reset_index(drop=True)
                 m = min(len(y_true_price), len(preds_price))
                 if m > 1:
-                    r2_price = r2_score(y_true_price.iloc[:m], preds_price.iloc[:m])
-                    confidence = float(r2_price)
-                    print(f"[mljar] Holdout R^2 (returns): {r2_ret:.4f}")
-                    print(f"[mljar] Holdout R^2 (price):   {r2_price:.4f}")
+                    rmse = float(np.sqrt(mean_squared_error(y_true_price.iloc[:m], preds_price.iloc[:m])))
+                    print(f"[mljar] Holdout RMSE (price): {rmse:.6f}")
                 else:
-                    print("[mljar] Not enough samples to compute R^2 in price space")
+                    print("[mljar] Not enough samples to compute RMSE in price space")
             else:
-                y_true_np = np.asarray(y_test).astype(float).reshape(-1)
-                preds_np = np.asarray(preds).astype(float).reshape(-1)
+                y_true_np = np.asarray(y_test, dtype=float).reshape(-1)
+                preds_np = np.asarray(preds, dtype=float).reshape(-1)
                 m = min(len(y_true_np), len(preds_np))
                 if m > 1:
-                    r2 = r2_score(y_true_np[:m], preds_np[:m])
-                    confidence = float(r2)
-                    print(f"[mljar] Holdout R^2: {r2:.4f}")
+                    rmse = float(np.sqrt(mean_squared_error(y_true_np[:m], preds_np[:m])))
+                    print(f"[mljar] Holdout RMSE: {rmse:.6f}")
                 else:
-                    print("[mljar] Not enough samples to compute R^2")
+                    print("[mljar] Not enough samples to compute RMSE")
     except Exception as e:
-        print(f"[mljar] Skipping quick metric computation due to: {e}")
+        print(f"[mljar] Skipping RMSE computation due to: {e}")
 
     # Save predictions summary to MongoDB 'prediction' collection
     try:
@@ -741,7 +727,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "symbol": sym,
                         "collection": source_collection,
                         "expectedtime": expectedtime_iso,
-                        "confidence": confidence,
+                        "rmse": rmse,
                         args.target: float(next_pred),
                     }},
                     upsert=True,
@@ -778,7 +764,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                             "symbol": sym,
                             "collection": source_collection,
                             "expectedtime": latest_iso,
-                            "confidence": confidence,
+                            "rmse": rmse,
                             args.target: latest_pred,
                         }},
                         upsert=True,
