@@ -129,6 +129,82 @@ def _comma_list(s: Optional[str]) -> Optional[List[str]]:
     return [x for x in out if x]
 
 
+def _parse_int_list(s: Optional[str]) -> List[int]:
+    if not s:
+        return []
+    out: List[int] = []
+    for tok in str(s).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            n = int(tok)
+            if n > 0:
+                out.append(n)
+        except Exception:
+            continue
+    # unique and sorted
+    return sorted(set(out))
+
+
+def _featurize(
+    df: pd.DataFrame,
+    target: str,
+    time_col: Optional[str],
+    lags: List[int],
+    windows: List[int],
+) -> pd.DataFrame:
+    # Add simple time-derived features if time column is present and datetime-like
+    if time_col and time_col in df.columns:
+        try:
+            if not pd.api.types.is_datetime64_any_dtype(df[time_col]):
+                df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+        except Exception:
+            pass
+        if pd.api.types.is_datetime64_any_dtype(df[time_col]):
+            df["dow"] = df[time_col].dt.dayofweek
+            df["hour"] = df[time_col].dt.hour
+
+    # Choose a small set of base numeric columns to avoid feature explosion
+    base_candidates = [
+        target,
+        "ClosePrice",
+        "Close",
+        "close",
+        "Adj Close",
+        "adj_close",
+        "VWAP",
+        "vwap",
+        "Volume",
+        "volume",
+        "Open",
+        "High",
+        "Low",
+    ]
+    base_cols = [c for c in base_candidates if c in df.columns]
+    if target in df.columns and target not in base_cols:
+        base_cols.insert(0, target)
+
+    # Add lag features
+    for col in base_cols:
+        for L in lags:
+            try:
+                df[f"{col}_lag{L}"] = df[col].shift(L)
+            except Exception:
+                pass
+
+    # Add rolling mean/std features
+    for col in base_cols:
+        for W in windows:
+            try:
+                df[f"{col}_rollmean{W}"] = df[col].rolling(W).mean()
+                df[f"{col}_rollstd{W}"] = df[col].rolling(W).std()
+            except Exception:
+                pass
+
+    return df
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Run AutoML with mljar-supervised on CSV or MongoDB data."
@@ -262,6 +338,36 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=5,
         help="Number of folds for kfold validation (default: 5).",
     )
+    p.add_argument(
+        "--lags",
+        default="1,2,3",
+        help="Comma-separated positive integers for lag features to add (default: 1,2,3).",
+    )
+    p.add_argument(
+        "--rolling-windows",
+        default="5,10",
+        help="Comma-separated positive integers for rolling window features (mean/std) (default: 5,10).",
+    )
+    p.add_argument(
+        "--golden-features",
+        action="store_true",
+        help="Enable AutoML golden features generation in mljar (disabled by default).",
+    )
+    p.add_argument(
+        "--features-selection",
+        action="store_true",
+        help="Enable AutoML feature selection in mljar (disabled by default).",
+    )
+    p.add_argument(
+        "--stack-models",
+        action="store_true",
+        help="Enable model stacking in mljar (disabled by default).",
+    )
+    p.add_argument(
+        "--train-ensemble",
+        action="store_true",
+        help="Enable training of ensembles in mljar (disabled by default).",
+    )
     return p.parse_args(argv)
 
 
@@ -336,6 +442,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[mljar] Using time column: t")
     else:
         print("[mljar] Warning: No time column found. Provide one via --time-column (e.g., 't').")
+    # Basic time-aware feature engineering
+    try:
+        lags = _parse_int_list(getattr(args, "lags", None) or "1,2,3")
+        windows = _parse_int_list(getattr(args, "rolling_windows", None) or "5,10")
+        if "t" in df.columns:
+            # Drop duplicate timestamps to avoid leakage
+            df = df.drop_duplicates(subset=["t"], keep="last")
+        df = _featurize(df, args.target, "t" if "t" in df.columns else None, lags, windows)
+    except Exception as e:
+        print(f"[mljar] Featurization skipped due to error: {e}")
     # If next-step forecasting is requested, shift target and prepare next-step features
     if getattr(args, "predict_next", False):
         if not detected_time_col:
@@ -366,6 +482,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     times_series = df["t"] if "t" in df.columns else None
     # Split X and y
     X, y = _split_xy(df, args.target)
+    # Drop rows where target is missing
+    if y.isna().any():
+        notna_idx = y.notna()
+        X = X.loc[notna_idx].reset_index(drop=True)
+        y = y.loc[notna_idx].reset_index(drop=True)
     # Drop time columns from features to prevent leakage
     drop_time_cols = []
     if "t" in X.columns:
@@ -389,8 +510,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             X, y, test_size=args.test_size, random_state=args.random_state, shuffle=False
         )
     elif times_series is not None:
+        # Preserve chronological order for time-series data; stratification is incompatible with shuffle=False
         X_train, X_test, y_train, y_test, t_train, t_test = train_test_split(
-            X, y, times_series, test_size=args.test_size, random_state=args.random_state, stratify=stratify
+            X, y, times_series, test_size=args.test_size, random_state=args.random_state, shuffle=False, stratify=None
         )
     else:
         X_train, X_test, y_train, y_test = train_test_split(
@@ -409,18 +531,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Build validation strategy
     validation_strategy = None
     tr = max(0.5, min(float(args.train_ratio), 0.95))
-    # mljar-supervised doesn't support 'time' validation in the current version; fallback to 'split'
+    # mljar-supervised doesn't support 'time' validation in the current version; use split with shuffle control
     if args.validation_type == "auto":
         if args.predict_next or ("t" in df.columns):
             print("[mljar] Using split validation (fallback from time) for time-ordered data")
-            validation_strategy = {"validation_type": "split", "train_ratio": tr}
+            validation_strategy = {"validation_type": "split", "train_ratio": tr, "shuffle": False}
         else:
-            validation_strategy = {"validation_type": "split", "train_ratio": tr}
+            validation_strategy = {"validation_type": "split", "train_ratio": tr, "shuffle": True}
     elif args.validation_type == "time":
         print("[mljar] validation_type 'time' not supported; falling back to 'split'")
-        validation_strategy = {"validation_type": "split", "train_ratio": tr}
+        validation_strategy = {"validation_type": "split", "train_ratio": tr, "shuffle": False}
     elif args.validation_type == "split":
-        validation_strategy = {"validation_type": "split", "train_ratio": tr}
+        validation_strategy = {
+            "validation_type": "split",
+            "train_ratio": tr,
+            "shuffle": not (args.predict_next or ("t" in df.columns)),
+        }
     elif args.validation_type == "kfold":
         kf = max(2, int(args.k_folds))
         validation_strategy = {"validation_type": "kfold", "k_folds": kf}
@@ -439,13 +565,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         explain_level=args.explain_level,
         random_state=args.random_state,
         verbose=args.verbose,
-        # Let AutoML detect task, but we provide a hint via 'ml_task' if desired.
-        # ml_task=task_hint,
+        ml_task=task_hint,
     )
     if validation_strategy:
         automl_kwargs["validation_strategy"] = validation_strategy
     if algorithms:
         automl_kwargs["algorithms"] = algorithms
+    # Optional stronger modeling features (opt-in)
+    if getattr(args, "golden_features", False):
+        automl_kwargs["golden_features"] = True
+    if getattr(args, "features_selection", False):
+        automl_kwargs["features_selection"] = True
+    if getattr(args, "stack_models", False):
+        automl_kwargs["stack_models"] = True
+    if getattr(args, "train_ensemble", False):
+        automl_kwargs["train_ensemble"] = True
 
     automl = AutoML(**automl_kwargs)
 
