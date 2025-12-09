@@ -117,7 +117,7 @@ def _detect_task(y: pd.Series) -> str:
 def _split_xy(df: pd.DataFrame, target: str) -> Tuple[pd.DataFrame, pd.Series]:
     if target not in df.columns:
         raise SystemExit(f"Target column '{target}' not found in data columns: {list(df.columns)}")
-    y = df[target]
+    y = df[target].squeeze()
     X = df.drop(columns=[target])
     return X, y
 
@@ -482,9 +482,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     times_series = df["t"] if "t" in df.columns else None
     # Split X and y
     X, y = _split_xy(df, args.target)
+    # Ensure target is a 1-D Series
+    if isinstance(y, pd.DataFrame):
+        if y.shape[1] == 1:
+            y = y.iloc[:, 0]
+        else:
+            raise SystemExit(f"Target '{args.target}' produced multiple columns; please specify a single target column.")
     # Drop rows where target is missing
-    if y.isna().any():
-        notna_idx = y.notna()
+    if y.isna().values.any():
+        notna_idx = ~y.isna().values
         X = X.loc[notna_idx].reset_index(drop=True)
         y = y.loc[notna_idx].reset_index(drop=True)
     # Drop time columns from features to prevent leakage
