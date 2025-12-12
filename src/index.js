@@ -353,11 +353,11 @@ async function main() {
     console.warn('syncTrades on startup failed:', e && e.message ? e.message : e);
   }
 
-  // Sync orders on startup (last 365 days)
+  // Sync orders on startup (last 30 days)
   try {
     if (alpacaClient) {
-      await syncOrders(alpacaClient, db, { daysBack: 365 });
-      console.log('syncOrders (365d) completed on startup');
+      await syncOrders(alpacaClient, db, { daysBack: 30 });
+      console.log('syncOrders (30d) completed on startup');
     } else {
       console.warn('Skipping syncOrders: missing Alpaca credentials');
     }
@@ -365,11 +365,11 @@ async function main() {
     console.warn('syncOrders on startup failed:', e && e.message ? e.message : e);
   }
 
-  // Sync account activities on startup (last 365 days)
+  // Sync account activities on startup (last 30 days)
   try {
     if (alpacaClient) {
-      await syncActivities(alpacaClient, db, { daysBack: 365, paper: settings.isPaper });
-      console.log('syncActivities (365d) completed on startup');
+      await syncActivities(alpacaClient, db, { daysBack: 30, paper: settings.isPaper });
+      console.log('syncActivities (30d) completed on startup');
     } else {
       console.warn('Skipping syncActivities: missing Alpaca credentials');
     }
@@ -438,7 +438,7 @@ async function main() {
         if (timers._ordersRunning) return;
         timers._ordersRunning = true;
         try {
-          await syncOrders(alpacaClient, db, { daysBack: 365 });
+          await syncOrders(alpacaClient, db, { daysBack: 30 });
         } catch (_) {
           // no-op
         } finally {
